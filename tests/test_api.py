@@ -25,6 +25,15 @@ def api(tmp_path, monkeypatch):
         yield client, m
 
 
+def test_deleted_database_recovers(api):
+    client, m = api
+    (m.ROOT / "jobs.sqlite3").unlink()
+    m.ROOT.rmdir()
+    response = client.get("/jobs")
+    assert response.status_code == 200
+    assert response.json() == []
+
+
 def finish(client, job_id):
     for _ in range(200):
         response = client.get(f"/jobs/{job_id}").json()

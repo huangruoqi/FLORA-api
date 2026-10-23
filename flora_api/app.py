@@ -29,8 +29,10 @@ engine = None
 
 
 def database():
+    ROOT.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(ROOT / "jobs.sqlite3", timeout=30)
     db.row_factory = sqlite3.Row
+    db.execute("CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY,status TEXT,payload TEXT)")
     return db
 
 

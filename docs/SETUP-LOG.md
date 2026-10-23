@@ -401,3 +401,14 @@ Reproduction and undo instructions are in `examples/README.md`.
 - [NVIDIA noncommercial model license](https://huggingface.co/nvidia/Flora-TempSeg/blob/main/LICENSE.pdf)
 - [Label Studio TimelineLabels](https://labelstud.io/tags/timelinelabels)
 - [HumanSignal frame conversion implementation](https://github.com/HumanSignal/label-studio-ml-backend/blob/master/label_studio_ml/examples/yolo/utils/converter.py)
+
+## Database repair after deleting all tasks
+
+The user removed all local task files, including .runtime/jobs/jobs.sqlite3.
+The running API then returned HTTP 500 for GET /jobs because the jobs table
+was missing. Recreated an empty jobs table; SQLite integrity_check returned
+ok and the task count was zero. The loaded NF4 model was kept running.
+Database connections now create the data directory and schema when missing.
+Added a regression test deleting the database and directory during service
+operation, then verifying GET /jobs recovers with an empty list.
+
