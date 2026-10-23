@@ -9,9 +9,11 @@ import pytest
 def api(tmp_path, monkeypatch):
     monkeypatch.setenv("FLORA_DATA_DIR", str(tmp_path / "jobs"))
     monkeypatch.delenv("FLORA_API_TOKEN", raising=False)
+    monkeypatch.delenv("FLORA_PRECISION", raising=False)
     import flora_api.app as module
     m = importlib.reload(module)
     class FakeEngine:
+        precision = "nf4"
         session = SimpleNamespace(model=None)
         def segment(self, path, profile, instruction):
             if path.read_bytes() == b"bad":
@@ -41,7 +43,7 @@ def test_job_and_label_studio(api):
     job = finish(client, job_id)
     assert job["status"] == "completed"
     summary = client.get("/jobs").json()
-    assert summary == [{"id": job_id, "status": "completed", "duration_s": 2, "segments": 1}]
+    assert summary == [{"id": job_id, "status": "completed", "duration_s": 2, "precision": "nf4", "segments": 1}]
     result = job["prediction"]["result"][0]
     assert result["value"]["ranges"] == [{"start": 13, "end": 36}]
     task = client.get(f"/jobs/{job_id}/label-studio").json()[0]
@@ -60,6 +62,41 @@ def test_failed_job_and_input_validation(api):
     assert finish(client, job["id"])["status"] == "failed"
     assert client.get(f"/jobs/{job['id']}/label-studio").status_code == 409
     assert client.get("/jobs/invalid").status_code == 404
+    assert client.post("/jobs", files={"video": ("v.mp4", b"x")}, data={"precision": "invalid"}).status_code == 422
+    assert client.post("/jobs", files={"video": ("v.mp4", b"x")}, data={"generation_timeout_s": "1"}).status_code == 422
+
+
+def test_precision_switch_and_rerun_preserve_original(api, monkeypatch):
+    client, m = api
+    import flora_api.engine as engine_module
+    closed = []
+    class PrecisionEngine:
+        session = SimpleNamespace(model=None)
+        def __init__(self, precision):
+            self.precision = precision
+        def close(self):
+            closed.append(self.precision)
+        def segment(self, path, profile, instruction):
+            assert path.read_bytes() == b"video"
+            return {"duration_s": 2, "fps": 24, "segments": []}
+    monkeypatch.setattr(engine_module, "Engine", PrecisionEngine)
+    monkeypatch.setattr(m, "engine", None)
+    first = client.post("/jobs", files={"video": ("v.mp4", b"video")},
+                        data={"precision": "nf4", "export_clips": "false"}).json()
+    assert finish(client, first["id"])["precision"] == "nf4"
+    second = client.post(f"/jobs/{first['id']}/rerun", json={"precision": "bf16_offload"}).json()
+    result = finish(client, second["id"])
+    assert result["status"] == "completed"
+    assert result["precision"] == "bf16_offload"
+    assert result["request"]["generation_timeout_s"] == 900
+    assert result["prediction"]["model_version"] == "flora-tempseg-bf16_offload-v1"
+    assert closed == ["nf4"]
+    assert client.get(f"/jobs/{first['id']}").json()["precision"] == "nf4"
+    third = client.post(f"/jobs/{second['id']}/rerun", json={"precision": "fp32_offload"}).json()
+    assert finish(client, third["id"])["precision"] == "fp32_offload"
+    assert closed == ["nf4", "bf16_offload"]
+    assert m.engine.session.generation_timeout_s == 1800
+    assert client.post(f"/jobs/{first['id']}/rerun", json={"precision": "bad"}).status_code == 422
 
 
 def test_token(api, monkeypatch):

@@ -222,6 +222,71 @@ clip thumbnails render, selecting split 02 updates the selection to
 4.60–13.65 seconds / frames 139–410, and the selected clip plays. API tests also
 cover public shell access with protected job-list access when a token is set.
 
+## Per-job precision follow-up
+
+Added a multipart `precision` field to `POST /jobs` and a JSON precision option
+to `POST /jobs/{job_id}/rerun`. Supported values are `nf4`, `bf16_offload`
+(NVIDIA's native unquantized BF16 base / FP32 GDN+LoRA precision), and
+`fp32_offload` (actual FP32 weights and compute, without BF16 autocast).
+The preview page exposes all three choices and can rerun an uploaded video
+without replacing its original results. The CLI accepts `--precision` as well.
+
+Precision is a property of each model session, not a global environment toggle.
+The single worker closes and frees the previous session before switching modes.
+Queued/failed/completed job receipts, prediction model versions, job summaries,
+and health responses identify precision. Completed jobs report model-loading,
+segmentation and total processing seconds separately.
+
+To avoid repeated offload reads through the OneDrive/Windows mount, copied the
+existing caches to WSL's Linux filesystem; the original caches were retained:
+
+```bash
+mkdir -p /home/huang/.cache/flora-api
+cp -a .runtime/huggingface /home/huang/.cache/flora-api/
+cp -a .runtime/models /home/huang/.cache/flora-api/
+```
+
+The start script now defaults to these Linux cache locations. Disk offload uses
+`~/.cache/flora-api/offload/<precision>/`; each precision has separate files.
+No WSL memory, swap, Windows driver or firewall settings were changed.
+
+Ran the complete regression suite: **7 passed**, including precision validation,
+NF4→BF16→FP32 session switching, precision-specific prediction versions, and
+preservation of the original job during reruns. The switching test uses mock
+engines; actual GPU timings are recorded separately.
+
+Verified the new selector in the browser and submitted the existing sample
+through **Unquantized · BF16 + FP32 (NVIDIA precision)** → **Run this video again**.
+New benchmark job: `3429ddf5cf044815bf69c7726850dcc3`.
+
+That first unquantized attempt hit the reference loader's 300-second generation
+limit: 176 tokens generated in 301.846 seconds, without a completed response.
+It failed validation and did not export partial predictions. This was not a
+completed two-minute prelabeling run. Both the adapter and GDN checkpoint-value
+checks passed before inference.
+
+For offline prelabeling, increased per-window generation limits to 300 seconds
+for NF4, 900 seconds for native BF16, and 1800 seconds for FP32. Added a bounded
+`generation_timeout_s` request override (30–3600 seconds) and CLI
+`--generation-timeout`. Increased the default CPU placement budget from 10 GiB
+to 12 GiB to reduce disk offloading, without changing WSL's own memory limit.
+Ran all seven tests again successfully after these changes.
+
+At the user's direction to use offline jobs, submitted a fresh sample rerun:
+
+```powershell
+Invoke-RestMethod -Method Post http://localhost:8008/jobs/a951aa5ccc9a427d836ad44dca036be0/rerun `
+  -ContentType 'application/json' `
+  -Body '{"precision":"bf16_offload","generation_timeout_s":900}'
+```
+
+Offline job ID: `41bbb5744d5b4412847d51900de93bd7`.
+Receipt: `.runtime/offline-fullprecision-job.json` (local only).
+The job runs independently of the preview browser; keep the API process running.
+Final completion time is not yet known. The original five NF4 clips are retained.
+FP32 selection/model-switch routing is covered by tests using mock engines; an
+actual all-FP32 GPU job has not been validated on this PC.
+
 ## Sources
 
 - [NVIDIA model card](https://huggingface.co/nvidia/Flora-TempSeg)

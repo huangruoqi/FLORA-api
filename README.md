@@ -13,7 +13,9 @@ while retaining FP32 Gated DeltaNet/LoRA values and leaving the vision encoder
 and output head unquantized. This is an experimental deployment adaptation,
 not NVIDIA's validated configuration; quantization can change predictions.
 An optional `FLORA_PRECISION=bf16_offload` mode retains the unquantized base and
-uses GPU/CPU/disk offloading, but was too slow in the initial test on this PC.
+uses GPU/CPU/disk offloading. A separate `fp32_offload` option loads all base
+weights as FP32 and disables BF16 compute autocast. Both unquantized modes can
+be considerably slower on a 16 GB GPU.
 `/health` distinguishes an available API from a loaded model. Check the setup
 log for what has actually been verified.
 
@@ -56,11 +58,12 @@ checksums selected by that reference's `batch_utils/models.json`.
 NVIDIA's vendor-code manifest and model manifests are verified before inference.
 The adapter's FP32 values and GDN values are checked at load time.
 
-All generated runtime files and videos are ignored by Git. Do not put the
-model cache in a cloud-sync folder if avoidable: set `HF_HOME`,
-`FLORA_MODEL_CACHE`, `FLORA_OFFLOAD_DIR`, and `FLORA_DATA_DIR` to Linux disk
-locations for better I/O. Setup currently defaults to project-local paths for
-reproducibility and does not alter your WSL configuration.
+Generated runtime files and videos are ignored by Git. The start script uses
+`~/.cache/flora-api/` on the Linux filesystem for model downloads and offload
+files, avoiding slow repeated reads through the Windows/OneDrive mount.
+The Python environment, reference source, videos and SQLite receipts remain
+project-local. Set the cache variables below to override these locations.
+Setup does not alter your WSL configuration.
 
 ## Submit and poll
 
@@ -91,6 +94,48 @@ requests are not exposed by this first version. For VFR inputs, normalize to
 CFR first, then upload that exact normalized file and label that same file.
 Timing predictions remain approximate and need human review.
 
+## Precision per request
+
+Add the multipart `precision` field to `POST /jobs`. Omitting it uses
+`FLORA_PRECISION` (default `nf4`).
+
+| Value | Weight / compute precision | Placement |
+| --- | --- | --- |
+| `nf4` | 4-bit base linear layers, BF16 compute; FP32 GDN/adapter | GPU |
+| `bf16_offload` | Unquantized BF16 base; FP32 GDN/adapter; BF16 compute | GPU / CPU / disk |
+| `fp32_offload` | Unquantized FP32 base/GDN/adapter; FP32 compute | GPU / CPU / disk |
+
+`bf16_offload` matches NVIDIA's reference precision; “unquantized” does not mean
+all parameters are FP32. Choose `fp32_offload` for actual 32-bit weights and
+compute. The all-FP32 mode is experimental and has not been GPU-benchmarked on
+this PC. More precision is not a guarantee of better temporal boundaries.
+
+```powershell
+curl.exe -X POST http://localhost:8008/jobs -F "video=@C:/videos/demo.mp4" -F "precision=bf16_offload"
+# Reuse an already uploaded video; original job/results remain intact:
+curl.exe -X POST http://localhost:8008/jobs/JOB_ID/rerun -H "Content-Type: application/json" -d '{"precision":"bf16_offload"}'
+```
+
+In the preview webpage, choose **Run precision** and click **Run this video
+again**. Each rerun creates a separate job and automatically polls its status.
+The worker unloads the previous model before loading a different precision;
+two models are never intentionally held on the GPU together. Consecutive jobs
+with the same precision reuse the loaded model. Precision selection does not
+change process-wide environment settings.
+
+Receipts, results and Label Studio model versions record the selected precision.
+Completed jobs expose `elapsed_s` (processing including model load and clip
+export), `model_load_s`, and `segmentation_s`. `GET /health` reports default,
+supported and currently loaded precisions separately.
+
+Slow offloaded generation needs more than NVIDIA's original 300-second window
+deadline on this PC. Mode defaults are 300 seconds/window for NF4, 900 for
+unquantized BF16, and 1800 for FP32. Override using the multipart or rerun JSON
+field `generation_timeout_s` (30–3600 seconds). The CLI flag is
+`--generation-timeout`; increase its separate overall polling `--timeout` for
+long offloaded runs. The deadline is checked between generation steps and is
+not a hard wall-clock cancellation guarantee. Partial model outputs are rejected.
+
 ## Label Studio
 
 An Ubuntu client can perform upload, polling and import-file export in one step:
@@ -101,6 +146,7 @@ An Ubuntu client can perform upload, polling and import-file export in one step:
 
 Use `--video-url` for an existing accessible media URL, `--no-clips` to skip clip
 encoding, or `--timeout` to increase the default 30-minute polling deadline.
+Use `--precision bf16_offload` or `--precision fp32_offload` for unquantized runs.
 The client reads `FLORA_API_TOKEN` from the environment and preserves existing
 output files.
 
@@ -136,12 +182,12 @@ configure an authenticated HTTPS reverse proxy and accessible media storage.
 | `FLORA_PORT` | `8008` | API port |
 | `FLORA_API_TOKEN` | unset | Optional Bearer authentication on all routes |
 | `FLORA_CORS_ORIGINS` | localhost / 127.0.0.1 on port 8080 | Comma-separated Label Studio browser origins |
-| `FLORA_PRECISION` | `nf4` | `nf4` (GPU-resident 4-bit) or `bf16_offload` (experimental, slow) |
+| `FLORA_PRECISION` | `nf4` | Default request precision: `nf4`, `bf16_offload`, `fp32_offload` |
 | `FLORA_GPU_MEMORY` | `10GiB` | Accelerate GPU weight-placement budget |
-| `FLORA_CPU_MEMORY` | `10GiB` | CPU weight-placement budget |
-| `HF_HOME` | `.runtime/huggingface` | Hugging Face cache |
-| `FLORA_MODEL_CACHE` | `.runtime/models` | NVIDIA model snapshots |
-| `FLORA_OFFLOAD_DIR` | `.runtime/offload` | Accelerate disk offload |
+| `FLORA_CPU_MEMORY` | `12GiB` | CPU weight-placement budget |
+| `HF_HOME` | `~/.cache/flora-api/huggingface` | Hugging Face cache (start script) |
+| `FLORA_MODEL_CACHE` | `~/.cache/flora-api/models` | NVIDIA model snapshots (start script) |
+| `FLORA_OFFLOAD_DIR` | `~/.cache/flora-api/offload` | Accelerate offload root, with one subfolder per precision |
 | `FLORA_DATA_DIR` | `.runtime/jobs` | SQLite receipts, original videos, clips |
 
 Set variables in Ubuntu before `bash scripts/start.sh`. When setting an API
@@ -162,13 +208,13 @@ is stopped; there is no retention scheduler. Stop with Ctrl+C. Restart with
 ```bash
 PYTHONPATH="$PWD/.runtime/reference:$PWD" .runtime/venv/bin/python -m pytest -q
 # Real model download + GPU execution; synthetic video is not an accuracy benchmark:
-HF_HOME="$PWD/.runtime/huggingface" FLORA_MODEL_CACHE="$PWD/.runtime/models" \
+HF_HOME="$HOME/.cache/flora-api/huggingface" FLORA_MODEL_CACHE="$HOME/.cache/flora-api/models" \
   PYTHONPATH="$PWD/.runtime/reference:$PWD" .runtime/venv/bin/python scripts/smoke_model.py
 ```
 
 For out-of-memory failures, stop the server and close other GPU applications.
 The default NF4 mode places all weights on the GPU; the memory-budget variables
-apply only to `bf16_offload`. In that mode, reducing `FLORA_GPU_MEMORY` reserves
+apply to the two offload modes. In those modes, reducing `FLORA_GPU_MEMORY` reserves
 activation memory by shifting more weights to RAM/disk, which slows inference.
 If Hugging Face returns 401/403, obtain model access and set `HF_TOKEN` in the
 server environment, then restart. The API never returns this token.

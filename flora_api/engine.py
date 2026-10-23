@@ -2,19 +2,40 @@
 import math
 from bisect import bisect_left
 import os
+import time
 from pathlib import Path
+
+PRECISIONS = ("nf4", "bf16_offload", "fp32_offload")
+
+
+def validate_precision(value):
+    if value not in PRECISIONS:
+        raise ValueError("precision must be nf4, bf16_offload, or fp32_offload")
+    return value
 
 
 class ModelSession:
-    """Experimental 16 GB deployment; retain FP32 GDN/LoRA in both modes."""
-    def __init__(self):
+    """Experimental 16 GB deployment; retain FP32 GDN/LoRA in all modes."""
+    def __init__(self, precision):
+        self.precision = validate_precision(precision)
         self.model = self.proc = None
+        self.load_elapsed_s = 0
+        self.generation_timeout_s = 300 if precision == "nf4" else 900 if precision == "bf16_offload" else 1800
+
+    def close(self):
+        self.model = self.proc = None
+        import gc
+        import torch
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def load(self, kind):
         if kind != "tempseg":
             raise ValueError("This service only loads the segmenter")
         if self.model is not None:
             return self.model, self.proc
+        started = time.monotonic()
         import torch
         from batch_utils.models import snapshot, validate_manifest, processor
         from batch_utils.config import MODELS
@@ -37,13 +58,11 @@ class ModelSession:
         weights = adapter / "adapter_model.safetensors"
         if digest(weights) != MODELS["tempseg"]["sha256"]:
             raise RuntimeError("Adapter checksum mismatch")
-        offload = Path(os.environ.get("FLORA_OFFLOAD_DIR", ".runtime/offload"))
+        offload = Path(os.environ.get("FLORA_OFFLOAD_DIR", Path.home() / ".cache/flora-api/offload")) / self.precision
         offload.mkdir(parents=True, exist_ok=True)
         memory = {0: os.environ.get("FLORA_GPU_MEMORY", "10GiB"),
-                  "cpu": os.environ.get("FLORA_CPU_MEMORY", "10GiB")}
-        mode = os.environ.get("FLORA_PRECISION", "nf4")
-        if mode not in {"nf4", "bf16_offload"}:
-            raise ValueError("FLORA_PRECISION must be nf4 or bf16_offload")
+                  "cpu": os.environ.get("FLORA_CPU_MEMORY", "12GiB")}
+        mode = self.precision
         placement = {"device_map": "auto", "max_memory": memory,
                      "offload_folder": str(offload)}
         if mode == "nf4":
@@ -51,7 +70,7 @@ class ModelSession:
                 load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=True,
                 bnb_4bit_compute_dtype=torch.bfloat16, llm_int8_skip_modules=["visual", "lm_head"])}
         model, info = AutoModelForImageTextToText.from_pretrained(
-            base, local_files_only=True, dtype=torch.bfloat16,
+            base, local_files_only=True, dtype=torch.float32 if mode == "fp32_offload" else torch.bfloat16,
             attn_implementation="sdpa", output_loading_info=True, **placement)
         if any(info.get(k) for k in ("missing_keys", "unexpected_keys", "mismatched_keys", "error_msgs")):
             raise RuntimeError(f"Incomplete base model load: {info}")
@@ -68,17 +87,26 @@ class ModelSession:
         # Match NVIDIA's BF16 compute autocast without converting FP32 parameters.
         import types
         original = model.generate
+        session = self
         def generate(self, *args, **kwargs):
+            kwargs["max_time"] = session.generation_timeout_s
+            if mode == "fp32_offload":
+                return original(*args, **kwargs)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 return original(*args, **kwargs)
         model.generate = types.MethodType(generate, model)
         self.model, self.proc = model, processor("tempseg", adapter)
+        self.load_elapsed_s = round(time.monotonic() - started, 2)
         return self.model, self.proc
 
 
 class Engine:
-    def __init__(self):
-        self.session = ModelSession()
+    def __init__(self, precision=None):
+        self.precision = validate_precision(precision or os.environ.get("FLORA_PRECISION", "nf4"))
+        self.session = ModelSession(self.precision)
+
+    def close(self):
+        self.session.close()
 
     def segment(self, video, profile, instruction):
         from batch_utils.api import DataEnginePipeline
@@ -88,8 +116,12 @@ class Engine:
         main = videos["main"]
         if not main.cfr:
             raise ValueError("Label Studio timeline export requires a constant-frame-rate video; normalize to CFR first")
+        had_model = self.session.model is not None
+        started = time.monotonic()
         rows, audit = segment(videos, PROFILE_POOLS[canonical], self.session,
                               instruction, lambda *a, **k: None)
+        total = time.monotonic() - started
+        load_time = 0 if had_model else self.session.load_elapsed_s
         duration = videos["main"].duration_s
         for row in rows:
             if not (math.isfinite(row["start_s"]) and math.isfinite(row["end_s"])
@@ -101,4 +133,6 @@ class Engine:
         return {"duration_s": duration, "segments": rows, "windows": len(audit),
                 "fps": float(main.rate), "frame_count": len(main.pts_us),
                 "model_revisions": MODELS, "input_sha256": videos["main"].sha256,
-                "deployment": "experimental-" + os.environ.get("FLORA_PRECISION", "nf4")}
+                "profile": profile, "precision": self.precision,
+                "model_load_s": load_time, "segmentation_s": round(max(0, total - load_time), 2),
+                "deployment": "experimental-" + self.precision}

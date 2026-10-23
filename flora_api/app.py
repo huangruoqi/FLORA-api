@@ -11,11 +11,15 @@ import shutil
 import sqlite3
 import subprocess
 import threading
+import time
 from uuid import uuid4
+from typing import Literal
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+from .engine import validate_precision
 
 ROOT = Path(os.environ.get("FLORA_DATA_DIR", ".runtime/jobs")).resolve()
 MAX_BYTES = 256 * 1024 * 1024
@@ -48,7 +52,7 @@ def read(job_id):
 
 def prediction(result):
     # TimelineLabels uses one-based inclusive FRAME numbers, not seconds.
-    return {"model_version": "flora-tempseg-" + os.environ.get("FLORA_PRECISION", "nf4") + "-v1", "result": [
+    return {"model_version": "flora-tempseg-" + result["precision"] + "-v1", "result": [
         {"id": f"segment_{i}", "from_name": "segments", "to_name": "video",
          "type": "timelinelabels", "value": {"ranges": [{"start": s["start_frame"], "end": s["end_frame"]}],
                                                 "timelinelabels": ["Action"]}}
@@ -77,22 +81,29 @@ def worker():
         try:
             if job is None:
                 return
-            job_id, profile, instruction, clips, video_url = job
-            update(job_id, "running")
+            job_id, config = job
+            started = time.monotonic()
+            update(job_id, "running", precision=config["precision"], request=config)
+            if engine is not None and engine.precision != config["precision"]:
+                engine.close()
+                engine = None
             if engine is None:
                 from .engine import Engine
-                engine = Engine()
-            result = engine.segment(ROOT / job_id / "input.mp4", profile, instruction)
-            if clips:
+                engine = Engine(config["precision"])
+            engine.session.generation_timeout_s = config["generation_timeout_s"]
+            result = engine.segment(ROOT / job_id / "input.mp4", config["profile"], config["instruction"])
+            result["precision"] = config["precision"]
+            if config["export_clips"]:
                 make_clips(ROOT / job_id, result)
             result["prediction"] = prediction(result)
-            result["label_studio_task"] = {"data": {"video": video_url or f"/jobs/{job_id}/files/input.mp4",
+            result["label_studio_task"] = {"data": {"video": config["video_url"] or f"/jobs/{job_id}/files/input.mp4",
                                                    "flora_job_id": job_id, "fps": result["fps"]},
                                             "predictions": [result["prediction"]]}
-            update(job_id, "completed", **result)
+            update(job_id, "completed", **result, request=config, elapsed_s=round(time.monotonic() - started, 2))
         except Exception as exc:
             log.exception("FLORA job failed")
-            update(job[0], "failed", error=str(exc))
+            update(job[0], "failed", error=str(exc), precision=job[1]["precision"], request=job[1],
+                   elapsed_s=round(time.monotonic() - started, 2))
         finally:
             work.task_done()
 
@@ -139,6 +150,7 @@ def list_jobs():
         rows = db.execute("SELECT * FROM jobs ORDER BY rowid DESC LIMIT 30").fetchall()
     return [{"id": r["id"], "status": r["status"],
              "duration_s": json.loads(r["payload"]).get("duration_s"),
+             "precision": json.loads(r["payload"]).get("precision", "nf4"),
              "segments": len(json.loads(r["payload"]).get("segments", []))} for r in rows]
 
 
@@ -147,15 +159,45 @@ def health():
     import torch
     return {"status": "up", "cuda": torch.cuda.is_available(),
             "model_loaded": engine is not None and engine.session.model is not None,
-            "queued": work.qsize(), "deployment": "experimental-" + os.environ.get("FLORA_PRECISION", "nf4")}
+            "queued": work.qsize(), "default_precision": os.environ.get("FLORA_PRECISION", "nf4"),
+            "loaded_precision": engine.precision if engine and engine.session.model is not None else None,
+            "supported_precisions": ["nf4", "bf16_offload", "fp32_offload"]}
+
+
+def job_config(profile, instruction, clips, video_url, precision, generation_timeout_s=0):
+    try:
+        precision = validate_precision(precision or os.environ.get("FLORA_PRECISION", "nf4"))
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    if generation_timeout_s and not 30 <= generation_timeout_s <= 3600:
+        raise HTTPException(422, "generation_timeout_s must be 30–3600 seconds, or 0 for the mode default")
+    timeout = generation_timeout_s or {"nf4": 300, "bf16_offload": 900, "fp32_offload": 1800}[precision]
+    return {"profile": profile, "instruction": instruction, "export_clips": clips,
+            "video_url": video_url, "precision": precision, "generation_timeout_s": timeout}
+
+
+def enqueue(job_id, config):
+    with database() as db:
+        db.execute("INSERT INTO jobs VALUES (?,?,?)", (job_id, "queued", json.dumps(
+            {"precision": config["precision"], "request": config})))
+    try:
+        work.put_nowait((job_id, config))
+    except queue.Full:
+        update(job_id, "failed", error="Queue full", precision=config["precision"], request=config)
+        raise HTTPException(429, "GPU queue full; retry later")
+    return {"id": job_id, "status": "queued", "precision": config["precision"],
+            "status_url": f"/jobs/{job_id}"}
 
 
 @app.post("/jobs", status_code=202)
 async def submit(video: UploadFile = File(...), profile: str = Form("human"),
                  instruction: str = Form(""), export_clips: bool = Form(True),
-                 video_url: str = Form("")):
+                 video_url: str = Form(""),
+                 precision: Literal["", "nf4", "bf16_offload", "fp32_offload"] = Form(""),
+                 generation_timeout_s: int = Form(0, ge=0, le=3600)):
     if profile not in {"human", "yam", "dex", "tianji"} or len(instruction) > 2000:
         raise HTTPException(422, "Invalid profile or instruction longer than 2000 characters")
+    config = job_config(profile, instruction, export_clips, video_url, precision, generation_timeout_s)
     job_id = uuid4().hex
     folder = ROOT / job_id
     folder.mkdir()
@@ -169,19 +211,41 @@ async def submit(video: UploadFile = File(...), profile: str = Form("human"),
                 stream.write(chunk)
         if not size:
             raise HTTPException(422, "Empty video")
-        with database() as db:
-            db.execute("INSERT INTO jobs VALUES (?,?,?)", (job_id, "queued", "{}"))
-        try:
-            work.put_nowait((job_id, profile, instruction, export_clips, video_url))
-        except queue.Full:
-            update(job_id, "failed", error="Queue full")
-            raise HTTPException(429, "GPU queue full; retry later")
+        receipt = enqueue(job_id, config)
     except Exception:
         shutil.rmtree(folder)
         raise
     finally:
         await video.close()
-    return {"id": job_id, "status": "queued", "status_url": f"/jobs/{job_id}"}
+    return receipt
+
+
+class RerunRequest(BaseModel):
+    precision: Literal["nf4", "bf16_offload", "fp32_offload"]
+    generation_timeout_s: int | None = Field(default=None, ge=30, le=3600)
+
+
+@app.post("/jobs/{job_id}/rerun", status_code=202)
+def rerun(job_id: str, options: RerunRequest):
+    previous = read(job_id)
+    original = ROOT / job_id / "input.mp4"
+    if not original.is_file():
+        raise HTTPException(404, "Original video is no longer available")
+    config = dict(previous.get("request", job_config(
+        previous.get("profile", "human"), "", True, "", options.precision)))
+    config["precision"] = options.precision
+    # Use the new mode's deadline unless the caller explicitly overrides it.
+    config["generation_timeout_s"] = options.generation_timeout_s or {
+        "nf4": 300, "bf16_offload": 900, "fp32_offload": 1800}[options.precision]
+    new_id = uuid4().hex
+    folder = ROOT / new_id
+    folder.mkdir()
+    try:
+        shutil.copyfile(original, folder / "input.mp4")
+        return enqueue(new_id, config)
+    except Exception:
+        shutil.rmtree(folder)
+        raise
 
 
 @app.get("/jobs/{job_id}")
