@@ -12,7 +12,7 @@ def main():
     parser.add_argument("video", type=Path)
     parser.add_argument("--api", default="http://localhost:8008")
     parser.add_argument("--profile", default="human", choices=["human", "yam", "dex", "tianji"])
-    parser.add_argument("--precision", choices=["nf4", "bf16_offload", "fp32_offload"], default="")
+    parser.add_argument("--precision", choices=["nf4", "int8", "bf16_offload", "fp32_offload"], default="")
     parser.add_argument("--generation-timeout", type=int, default=0, help="Per-window generation deadline in seconds; 0 uses the mode default")
     parser.add_argument("--instruction", default="")
     parser.add_argument("--video-url", default="")

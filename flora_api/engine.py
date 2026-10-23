@@ -5,12 +5,13 @@ import os
 import time
 from pathlib import Path
 
-PRECISIONS = ("nf4", "bf16_offload", "fp32_offload")
+PRECISIONS = ("nf4", "int8", "bf16_offload", "fp32_offload")
+GENERATION_TIMEOUTS = {"nf4": 300, "int8": 300, "bf16_offload": 900, "fp32_offload": 1800}
 
 
 def validate_precision(value):
     if value not in PRECISIONS:
-        raise ValueError("precision must be nf4, bf16_offload, or fp32_offload")
+        raise ValueError("precision must be nf4, int8, bf16_offload, or fp32_offload")
     return value
 
 
@@ -20,7 +21,7 @@ class ModelSession:
         self.precision = validate_precision(precision)
         self.model = self.proc = None
         self.load_elapsed_s = 0
-        self.generation_timeout_s = 300 if precision == "nf4" else 900 if precision == "bf16_offload" else 1800
+        self.generation_timeout_s = GENERATION_TIMEOUTS[precision]
 
     def close(self):
         self.model = self.proc = None
@@ -69,6 +70,11 @@ class ModelSession:
             placement = {"device_map": {"": 0}, "quantization_config": BitsAndBytesConfig(
                 load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=True,
                 bnb_4bit_compute_dtype=torch.bfloat16, llm_int8_skip_modules=["visual", "lm_head"])}
+        elif mode == "int8":
+            # Quantize the output head too to leave activation headroom on 16 GB.
+            # The vision encoder remains BF16; GDN and adapter values stay FP32.
+            placement = {"device_map": {"": 0}, "quantization_config": BitsAndBytesConfig(
+                load_in_8bit=True, llm_int8_threshold=6.0, llm_int8_skip_modules=["visual"])}
         model, info = AutoModelForImageTextToText.from_pretrained(
             base, local_files_only=True, dtype=torch.float32 if mode == "fp32_offload" else torch.bfloat16,
             attn_implementation="sdpa", output_loading_info=True, **placement)
@@ -81,7 +87,7 @@ class ModelSession:
                 module._no_split_modules = sorted(module._no_split_modules)
         model = PeftModel.from_pretrained(model, adapter, adapter_name="candidate",
                                          autocast_adapter_dtype=True,
-                                         device_map={"": 0} if mode == "nf4" else "auto", max_memory=memory,
+                                         device_map={"": 0} if mode in {"nf4", "int8"} else "auto", max_memory=memory,
                                          offload_folder=str(offload)).eval()
         print("FLORA_OFFLOAD_VERIFICATION", verify_values(model, base, weights), flush=True)
         # Match NVIDIA's BF16 compute autocast without converting FP32 parameters.
@@ -118,6 +124,9 @@ class Engine:
             raise ValueError("Label Studio timeline export requires a constant-frame-rate video; normalize to CFR first")
         had_model = self.session.model is not None
         started = time.monotonic()
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
         rows, audit = segment(videos, PROFILE_POOLS[canonical], self.session,
                               instruction, lambda *a, **k: None)
         total = time.monotonic() - started
@@ -134,5 +143,6 @@ class Engine:
                 "fps": float(main.rate), "frame_count": len(main.pts_us),
                 "model_revisions": MODELS, "input_sha256": videos["main"].sha256,
                 "profile": profile, "precision": self.precision,
+                "cuda_peak_allocated_gib": round(torch.cuda.max_memory_allocated() / 1024 ** 3, 3),
                 "model_load_s": load_time, "segmentation_s": round(max(0, total - load_time), 2),
                 "deployment": "experimental-" + self.precision}

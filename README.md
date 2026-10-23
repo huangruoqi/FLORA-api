@@ -67,6 +67,12 @@ Setup does not alter your WSL configuration.
 
 ## Submit and poll
 
+For another computer on the same router (Ethernet or Wi-Fi), use the standalone
+[Python LAN client](examples/lan_client.py) and [server/client setup guide](examples/README.md).
+It can upload, poll, resume, and download clips plus Label Studio JSON. The guide
+includes optional Windows LAN forwarding; the localhost API is not remotely
+accessible until that setup is applied.
+
 PowerShell (use `curl.exe`, not the older PowerShell curl alias):
 
 ```powershell
@@ -81,6 +87,8 @@ one-based frame ranges, provenance from the native stitcher, clip download
 paths, model revisions and source SHA-256. `clip_path` is relative to the API
 origin. FFmpeg re-encodes video-only H.264 clips, without audio. Operations can
 overlap; clips can overlap and gaps can remain. No synthetic cuts fill gaps.
+`windows` counts model inference calls on overlapping temporal windows,
+including adaptive retry windows. It is not the number of final splits/clips.
 
 Set `export_clips=false` to return just boundaries/predictions. Optional
 `instruction` supplies an episode task (maximum 2000 characters). Optional
@@ -102,6 +110,7 @@ Add the multipart `precision` field to `POST /jobs`. Omitting it uses
 | Value | Weight / compute precision | Placement |
 | --- | --- | --- |
 | `nf4` | 4-bit base linear layers, BF16 compute; FP32 GDN/adapter | GPU |
+| `int8` | LLM.int8 base linear layers and output head; BF16 vision encoder; FP32 GDN/adapter | GPU |
 | `bf16_offload` | Unquantized BF16 base; FP32 GDN/adapter; BF16 compute | GPU / CPU / disk |
 | `fp32_offload` | Unquantized FP32 base/GDN/adapter; FP32 compute | GPU / CPU / disk |
 
@@ -123,13 +132,24 @@ two models are never intentionally held on the GPU together. Consecutive jobs
 with the same precision reuse the loaded model. Precision selection does not
 change process-wide environment settings.
 
+Choose **8-bit · INT8** in the page, send `precision=int8` to `POST /jobs`, or
+use CLI `--precision int8`. INT8 uses bitsandbytes LLM.int8 with its default
+outlier threshold of 6.0. Its output head is quantized to leave activation
+headroom on the 16 GB GPU; NF4 keeps that head unquantized. The vision encoder
+remains BF16 and adapter/GDN checkpoint values are verified as FP32. INT8 is
+configured to remain on the GPU and does not silently fall back to NF4 or CPU
+offloading if it runs out of memory. Review actual test results in the setup log.
+
 Receipts, results and Label Studio model versions record the selected precision.
 Completed jobs expose `elapsed_s` (processing including model load and clip
 export), `model_load_s`, and `segmentation_s`. `GET /health` reports default,
 supported and currently loaded precisions separately.
+Results also include `cuda_peak_allocated_gib`, reset per job, for PyTorch's peak
+GPU tensor allocation; driver/display usage and the CUDA allocator reserve are
+additional memory consumers.
 
 Slow offloaded generation needs more than NVIDIA's original 300-second window
-deadline on this PC. Mode defaults are 300 seconds/window for NF4, 900 for
+deadline on this PC. Mode defaults are 300 seconds/window for NF4 and INT8, 900 for
 unquantized BF16, and 1800 for FP32. Override using the multipart or rerun JSON
 field `generation_timeout_s` (30–3600 seconds). The CLI flag is
 `--generation-timeout`; increase its separate overall polling `--timeout` for
@@ -182,7 +202,7 @@ configure an authenticated HTTPS reverse proxy and accessible media storage.
 | `FLORA_PORT` | `8008` | API port |
 | `FLORA_API_TOKEN` | unset | Optional Bearer authentication on all routes |
 | `FLORA_CORS_ORIGINS` | localhost / 127.0.0.1 on port 8080 | Comma-separated Label Studio browser origins |
-| `FLORA_PRECISION` | `nf4` | Default request precision: `nf4`, `bf16_offload`, `fp32_offload` |
+| `FLORA_PRECISION` | `nf4` | Default request precision: `nf4`, `int8`, `bf16_offload`, `fp32_offload` |
 | `FLORA_GPU_MEMORY` | `10GiB` | Accelerate GPU weight-placement budget |
 | `FLORA_CPU_MEMORY` | `12GiB` | CPU weight-placement budget |
 | `HF_HOME` | `~/.cache/flora-api/huggingface` | Hugging Face cache (start script) |
@@ -213,7 +233,7 @@ HF_HOME="$HOME/.cache/flora-api/huggingface" FLORA_MODEL_CACHE="$HOME/.cache/flo
 ```
 
 For out-of-memory failures, stop the server and close other GPU applications.
-The default NF4 mode places all weights on the GPU; the memory-budget variables
+NF4 and INT8 place all weights on the GPU; the memory-budget variables
 apply to the two offload modes. In those modes, reducing `FLORA_GPU_MEMORY` reserves
 activation memory by shifting more weights to RAM/disk, which slows inference.
 If Hugging Face returns 401/403, obtain model access and set `HF_TOKEN` in the

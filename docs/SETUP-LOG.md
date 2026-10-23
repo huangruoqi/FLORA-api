@@ -287,6 +287,84 @@ Final completion time is not yet known. The original five NF4 clips are retained
 FP32 selection/model-switch routing is covered by tests using mock engines; an
 actual all-FP32 GPU job has not been validated on this PC.
 
+## INT8 follow-up
+
+Added `precision=int8` to uploads, reruns, the CLI, health metadata and preview
+selector. Uses the already-installed bitsandbytes 0.50.2 LLM.int8 implementation
+with default outlier threshold 6.0. Quantizes base linear layers and the output
+head, keeps the vision encoder BF16 and verifies saved FP32 GDN/LoRA values.
+Quantizing the output head, which NF4 leaves unquantized, reserves more GPU
+space for INT8 activations. INT8 requests use GPU placement and never silently
+switch to NF4 or offloading on failure. Default timeout: 300 seconds per window.
+
+The API queue was idle before restarting to enable INT8. Previous NF4 jobs
+and clips were preserved. All **7 regression tests passed**, including routing
+and session switching through NF4 → INT8 → BF16 → FP32 with mock engines.
+
+Submitted the existing 24-second sample through the real endpoint:
+
+```powershell
+Invoke-RestMethod -Method Post http://localhost:8008/jobs/43315db37d0c47729b9ca483f71294ff/rerun `
+  -ContentType 'application/json' -Body '{"precision":"int8"}'
+```
+
+INT8 job: `093a88ecc88b49bea91b1a1d91dae871`.
+Local receipt: `.runtime/int8-job.json`.
+The existing NF4 baseline reported 48.33 seconds total, including 9.09 seconds
+model loading, 27.69 seconds segmentation, and four inference windows.
+
+**INT8 completed successfully**: 176.53 seconds total, 68.23 seconds loading,
+101.32 seconds segmentation, four windows and five clips. Peak PyTorch CUDA
+tensor allocation was **13.522 GiB**. Windows GPU usage was close to capacity
+during inference (approximately 15.5 GiB including other allocations), so
+headroom is limited. The configuration places all model parameters on CUDA;
+there is no configured CPU offload for INT8. This validates this particular
+sample, not arbitrary longer contexts or other GPU memory usage.
+
+## Python LAN client follow-up
+
+Created `examples/lan_client.py`, `examples/requirements.txt` (HTTPX only), and
+`examples/README.md` for another computer on the same router/LAN. The client
+can check health, upload a local video, choose precision, poll/resume a job, and
+download result JSON, Label Studio JSON and generated clips. Tokens are read
+from `FLORA_API_TOKEN`; HTTP environment proxies are disabled for the selected
+local server. Download URLs and job IDs are validated before filesystem writes.
+
+Observed the server's default-gateway interface is Ethernet 2, LAN IPv4
+`10.0.0.141`; its Wi-Fi interface has a link-local `169.254.*` address and is
+not the endpoint to use. Ethernet on the server and Wi-Fi on the client are
+compatible when both devices can communicate on the same LAN.
+
+Verified Windows currently listens only at `127.0.0.1:8008`. The guide provides
+optional administrator commands for a Windows port proxy from
+`10.0.0.141:8009` to `127.0.0.1:8008`, plus a Private-profile/LocalSubnet firewall
+rule. Those changes were documented, **not applied**. No LAN/public listener,
+firewall exception or token was created automatically. The Python example
+defaults to the documented bridge URL and supports a `--server` override.
+
+Tested the Python client's actual upload → poll → prediction export → clip
+download flow against the existing localhost API, using NF4 at the user's
+request:
+
+```bash
+.runtime/venv/bin/python examples/lan_client.py --server http://127.0.0.1:8008 \
+  --video /mnt/c/Users/huang/Downloads/0ac0a71f-98e3-4b09-3273-6d19ede20a7d.mp4 \
+  --precision nf4 --output-dir .runtime/nf4-client-test
+```
+
+New NF4 job: `095040fc5f384029a435ec59f250f682`, completed with five clips and
+four inference windows. Measured 42.53 seconds total, 7.59 seconds loading,
+29.07 seconds segmentation, and 11.147 GiB peak CUDA tensor allocation.
+The client saved `receipt.json`, `result.json`, `label-studio.json` and all five
+clips under its job folder. SHA-256 hashes of every downloaded clip matched
+the server's corresponding file. Tested `--job-id` resume: it retrieved the
+existing results and preserved the existing clips and original receipt,
+without scheduling another inference job.
+
+Client upload/download testing was performed on the same PC over loopback.
+Cross-device LAN connectivity remains untested and requires the administrator
+bridge/firewall setup in `examples/README.md` and a request from the second PC.
+
 ## Sources
 
 - [NVIDIA model card](https://huggingface.co/nvidia/Flora-TempSeg)

@@ -19,7 +19,7 @@ from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, Upload
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from .engine import validate_precision
+from .engine import validate_precision, PRECISIONS, GENERATION_TIMEOUTS
 
 ROOT = Path(os.environ.get("FLORA_DATA_DIR", ".runtime/jobs")).resolve()
 MAX_BYTES = 256 * 1024 * 1024
@@ -161,7 +161,7 @@ def health():
             "model_loaded": engine is not None and engine.session.model is not None,
             "queued": work.qsize(), "default_precision": os.environ.get("FLORA_PRECISION", "nf4"),
             "loaded_precision": engine.precision if engine and engine.session.model is not None else None,
-            "supported_precisions": ["nf4", "bf16_offload", "fp32_offload"]}
+            "supported_precisions": list(PRECISIONS)}
 
 
 def job_config(profile, instruction, clips, video_url, precision, generation_timeout_s=0):
@@ -171,7 +171,7 @@ def job_config(profile, instruction, clips, video_url, precision, generation_tim
         raise HTTPException(422, str(exc)) from exc
     if generation_timeout_s and not 30 <= generation_timeout_s <= 3600:
         raise HTTPException(422, "generation_timeout_s must be 30–3600 seconds, or 0 for the mode default")
-    timeout = generation_timeout_s or {"nf4": 300, "bf16_offload": 900, "fp32_offload": 1800}[precision]
+    timeout = generation_timeout_s or GENERATION_TIMEOUTS[precision]
     return {"profile": profile, "instruction": instruction, "export_clips": clips,
             "video_url": video_url, "precision": precision, "generation_timeout_s": timeout}
 
@@ -193,7 +193,7 @@ def enqueue(job_id, config):
 async def submit(video: UploadFile = File(...), profile: str = Form("human"),
                  instruction: str = Form(""), export_clips: bool = Form(True),
                  video_url: str = Form(""),
-                 precision: Literal["", "nf4", "bf16_offload", "fp32_offload"] = Form(""),
+                 precision: Literal["", "nf4", "int8", "bf16_offload", "fp32_offload"] = Form(""),
                  generation_timeout_s: int = Form(0, ge=0, le=3600)):
     if profile not in {"human", "yam", "dex", "tianji"} or len(instruction) > 2000:
         raise HTTPException(422, "Invalid profile or instruction longer than 2000 characters")
@@ -221,7 +221,7 @@ async def submit(video: UploadFile = File(...), profile: str = Form("human"),
 
 
 class RerunRequest(BaseModel):
-    precision: Literal["nf4", "bf16_offload", "fp32_offload"]
+    precision: Literal["nf4", "int8", "bf16_offload", "fp32_offload"]
     generation_timeout_s: int | None = Field(default=None, ge=30, le=3600)
 
 
@@ -235,8 +235,7 @@ def rerun(job_id: str, options: RerunRequest):
         previous.get("profile", "human"), "", True, "", options.precision)))
     config["precision"] = options.precision
     # Use the new mode's deadline unless the caller explicitly overrides it.
-    config["generation_timeout_s"] = options.generation_timeout_s or {
-        "nf4": 300, "bf16_offload": 900, "fp32_offload": 1800}[options.precision]
+    config["generation_timeout_s"] = options.generation_timeout_s or GENERATION_TIMEOUTS[options.precision]
     new_id = uuid4().hex
     folder = ROOT / new_id
     folder.mkdir()

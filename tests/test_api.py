@@ -84,17 +84,23 @@ def test_precision_switch_and_rerun_preserve_original(api, monkeypatch):
     first = client.post("/jobs", files={"video": ("v.mp4", b"video")},
                         data={"precision": "nf4", "export_clips": "false"}).json()
     assert finish(client, first["id"])["precision"] == "nf4"
+    int8 = client.post(f"/jobs/{first['id']}/rerun", json={"precision": "int8"}).json()
+    int8_result = finish(client, int8["id"])
+    assert int8_result["status"] == "completed"
+    assert int8_result["precision"] == "int8"
+    assert int8_result["request"]["generation_timeout_s"] == 300
+    assert int8_result["prediction"]["model_version"] == "flora-tempseg-int8-v1"
     second = client.post(f"/jobs/{first['id']}/rerun", json={"precision": "bf16_offload"}).json()
     result = finish(client, second["id"])
     assert result["status"] == "completed"
     assert result["precision"] == "bf16_offload"
     assert result["request"]["generation_timeout_s"] == 900
     assert result["prediction"]["model_version"] == "flora-tempseg-bf16_offload-v1"
-    assert closed == ["nf4"]
+    assert closed == ["nf4", "int8"]
     assert client.get(f"/jobs/{first['id']}").json()["precision"] == "nf4"
     third = client.post(f"/jobs/{second['id']}/rerun", json={"precision": "fp32_offload"}).json()
     assert finish(client, third["id"])["precision"] == "fp32_offload"
-    assert closed == ["nf4", "bf16_offload"]
+    assert closed == ["nf4", "int8", "bf16_offload"]
     assert m.engine.session.generation_timeout_s == 1800
     assert client.post(f"/jobs/{first['id']}/rerun", json={"precision": "bad"}).status_code == 422
 
