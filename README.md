@@ -39,6 +39,11 @@ bash scripts/start.sh
 
 Windows can access [interactive API docs](http://localhost:8008/docs) and
 [health](http://localhost:8008/health) through WSL localhost forwarding.
+Open [the split review webpage](http://localhost:8008/preview) to review an
+existing job with the original video, clickable timeline, clip previews,
+downloads, and Label Studio export. Select a recent job or use
+`/preview?job=JOB_ID`. If authentication is enabled, enter the API token in the
+page; it stays in memory and is not saved in browser storage.
 The server uses one process and one worker thread to serialize GPU calls.
 Do not start multiple Uvicorn workers against this data directory.
 

@@ -206,6 +206,22 @@ The API is left running locally on port 8008 with the NF4 model loaded. It is
 not registered for automatic startup. Restart after stopping/rebooting using
 `wsl -d Ubuntu -- bash scripts/start.sh` from this repository directory.
 
+## Split review webpage follow-up
+
+Added `/` and `/preview` to the existing local API, plus an authenticated
+`GET /jobs` summary for selecting recent results. The page displays the original
+video, one timeline lane per proposed interval, playable clip cards, downloads,
+and Label Studio JSON export. Overlapping intervals remain visible on separate
+lanes. Static page access does not expose job data; API and media authorization
+still apply. Tokens entered in the page remain in browser memory only.
+
+Restarted the local API to load the page. Existing jobs/clips remain on disk;
+the model loads lazily on the next inference request after a server restart.
+Verified the webpage in the in-app browser: the sample's five intervals and
+clip thumbnails render, selecting split 02 updates the selection to
+4.60–13.65 seconds / frames 139–410, and the selected clip plays. API tests also
+cover public shell access with protected job-list access when a token is set.
+
 ## Sources
 
 - [NVIDIA model card](https://huggingface.co/nvidia/Flora-TempSeg)

@@ -98,6 +98,8 @@ def worker():
 
 
 def authorize(request: Request):
+    if request.url.path in {"/", "/preview"}:
+        return  # Static shell contains no job data; API/media still require auth.
     token = os.environ.get("FLORA_API_TOKEN", "")
     if token and not hmac.compare_digest(request.headers.get("Authorization", ""), "Bearer " + token):
         raise HTTPException(401, "Bearer token required")
@@ -123,6 +125,21 @@ app = FastAPI(title="FLORA video splitting", version="0.1.0", lifespan=lifespan,
 app.add_middleware(CORSMiddleware,
                    allow_origins=os.environ.get("FLORA_CORS_ORIGINS", "http://localhost:8080,http://127.0.0.1:8080").split(","),
                    allow_methods=["GET", "POST"], allow_headers=["Authorization", "Content-Type"])
+
+
+@app.get("/", include_in_schema=False)
+@app.get("/preview", include_in_schema=False)
+def preview():
+    return FileResponse(Path(__file__).with_name("preview.html"), media_type="text/html")
+
+
+@app.get("/jobs")
+def list_jobs():
+    with database() as db:
+        rows = db.execute("SELECT * FROM jobs ORDER BY rowid DESC LIMIT 30").fetchall()
+    return [{"id": r["id"], "status": r["status"],
+             "duration_s": json.loads(r["payload"]).get("duration_s"),
+             "segments": len(json.loads(r["payload"]).get("segments", []))} for r in rows]
 
 
 @app.get("/health")

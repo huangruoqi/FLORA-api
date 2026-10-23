@@ -40,6 +40,8 @@ def test_job_and_label_studio(api):
     job_id = response.json()["id"]
     job = finish(client, job_id)
     assert job["status"] == "completed"
+    summary = client.get("/jobs").json()
+    assert summary == [{"id": job_id, "status": "completed", "duration_s": 2, "segments": 1}]
     result = job["prediction"]["result"][0]
     assert result["value"]["ranges"] == [{"start": 13, "end": 36}]
     task = client.get(f"/jobs/{job_id}/label-studio").json()[0]
@@ -63,6 +65,9 @@ def test_failed_job_and_input_validation(api):
 def test_token(api, monkeypatch):
     client, _ = api
     monkeypatch.setenv("FLORA_API_TOKEN", "test-secret")
+    assert client.get("/preview").status_code == 200
+    assert client.get("/jobs").status_code == 401
+    assert client.get("/jobs", headers={"Authorization": "Bearer test-secret"}).json() == []
     assert client.post("/setup").status_code == 401
     assert client.post("/setup", headers={"Authorization": "Bearer test-secret"}).status_code == 200
 
