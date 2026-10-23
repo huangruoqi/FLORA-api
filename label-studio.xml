@@ -1,0 +1,6 @@
+<View>
+  <Video name="video" value="$video" frameRate="$fps" />
+  <TimelineLabels name="segments" toName="video">
+    <Label value="Action" background="#2878c8" />
+  </TimelineLabels>
+</View>
