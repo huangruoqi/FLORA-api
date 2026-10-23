@@ -365,6 +365,35 @@ Client upload/download testing was performed on the same PC over loopback.
 Cross-device LAN connectivity remains untested and requires the administrator
 bridge/firewall setup in `examples/README.md` and a request from the second PC.
 
+## LAN access enabled after user approval
+
+The second computer reported 100% ping packet loss. The server's Ethernet 2
+address was confirmed as `10.0.0.141/24`, with a Public network profile. Ping
+failure alone does not establish whether the HTTP API is reachable.
+
+Added `scripts/configure_lan.ps1` with administrator setup and `-Disable` undo.
+Automatic approval review initially rejected the persistent networking change
+because explicit authorization was missing. After the user said "allow it",
+the same administrator command completed with exit code 0.
+
+Applied a persistent Windows port proxy from `10.0.0.141:8009` to
+`127.0.0.1:8008`, and firewall rule `FLORA-LAN-8009`, restricted to TCP 8009,
+local address `10.0.0.141`, interface Ethernet 2, and clients `10.0.0.0/24`.
+The rule applies to all profiles; the Public profile remains unchanged.
+No ping rule or router port forwarding was added.
+
+Verified the proxy table, enabled firewall rule, successful setup receipt, and
+`http://10.0.0.141:8009/health` from the server PC: status up, CUDA available,
+NF4 loaded, queue empty. This confirms the local proxy path. A request from the
+second computer is still required to verify cross-device connectivity:
+
+```text
+python examples/lan_client.py --server http://10.0.0.141:8009 --check
+```
+
+The current LAN setup supersedes the earlier "not applied" networking notes.
+Reproduction and undo instructions are in `examples/README.md`.
+
 ## Sources
 
 - [NVIDIA model card](https://huggingface.co/nvidia/Flora-TempSeg)

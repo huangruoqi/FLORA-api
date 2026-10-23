@@ -10,25 +10,23 @@ No GPU, CUDA, FLORA model or Label Studio installation is needed on the client.
 The API currently listens through Windows at **127.0.0.1:8008**. That address is
 only accessible on the server PC. The following optional Windows bridge exposes
 it at **http://10.0.0.141:8009** without restarting the API or reloading the GPU.
-These administrator networking commands are provided here, **not automatically
-applied** by the Python client or this setup.
+This bridge was enabled on this PC with the user's approval. The Python client
+does not change networking settings.
 
-On the GPU server, open **PowerShell as Administrator**. Check the Ethernet
-network profile:
-
-```powershell
-Get-NetConnectionProfile | Format-Table InterfaceAlias, NetworkCategory
-```
-
-The rule below applies to a **Private** network. If your trusted home Ethernet
-connection is marked Public, change that connection to Private in Windows
-Network settings before proceeding. The rule permits only local-subnet clients
-on the specified server address and port; it does not disable the firewall.
+To reproduce the setup, keep the API running and open **PowerShell as
+Administrator** in the repository root:
 
 ```powershell
-netsh interface portproxy add v4tov4 listenaddress=10.0.0.141 listenport=8009 connectaddress=127.0.0.1 connectport=8008
-New-NetFirewallRule -Name "FLORA-LAN-8009" -DisplayName "FLORA LAN API 8009" -Direction Inbound -Action Allow -Protocol TCP -LocalAddress 10.0.0.141 -LocalPort 8009 -RemoteAddress LocalSubnet -Profile Private
+powershell.exe -NoProfile -File .\scripts\configure_lan.ps1
 ```
+
+The helper creates a persistent port proxy and firewall rule `FLORA-LAN-8009`.
+The rule permits TCP port 8009 on `10.0.0.141`, on **Ethernet 2** only, from
+clients in **10.0.0.0/24**. It applies to all network profiles so the existing
+Public Ethernet profile can remain unchanged. It does not disable the firewall
+or enable ping. Parameters allow adapting the address, interface, subnet and
+ports to another installation. Setup results are saved in
+`.runtime/lan-setup-result.json`.
 
 Keep the existing WSL API process running. Windows's IP Helper service handles
 the port proxy; check `Get-Service iphlpsvc` if the bridge does not listen.
@@ -53,8 +51,7 @@ from reaching one another even when they share a router.
 Undo just this bridge/firewall rule if no longer needed (Administrator):
 
 ```powershell
-netsh interface portproxy delete v4tov4 listenaddress=10.0.0.141 listenport=8009
-Remove-NetFirewallRule -Name "FLORA-LAN-8009"
+powershell.exe -NoProfile -File .\scripts\configure_lan.ps1 -Disable
 ```
 
 See [Microsoft's WSL networking guide](https://learn.microsoft.com/en-us/windows/wsl/networking)
